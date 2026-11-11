@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from typing import Any
 
 from langchain.agents import create_agent
@@ -9,10 +10,11 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from models import Bill, BillStatus, Database
-from payments import OPEN, PAID, GatewayOutcome, PaymentRequest, PaymentStore, SimulatedGateway
+from payments import OPEN, PAID, GatewayOutcome, PaymentRequest, PaymentStore, simulated_charge
 from search import DataLayer
 
 OVERDUE: BillStatus = "Overdue"
+REFERENCE_DATE: date = date(2025, 2, 25)
 
 SYSTEM_PROMPT: str = """You help a telecom customer pay an overdue bill. Each turn starts with no memory of earlier turns, so use the tools to find the current state.
 
@@ -20,9 +22,10 @@ Rules:
 - State only facts returned by the tools. Do not use general knowledge.
 - Quote bill and request IDs in your answer.
 - If the question does not say whose account it is, ask for a customer ID.
-- To pay a bill, call pay_bill with the bill ID. Pay only the bill the customer names.
-- If a customer returns, call check_payment_requests first and offer to resume any open request.
-- Say a bill is Paid only when pay_bill reports it is Paid.
+- Call get_customer_payment_details first. It lists the customer's usable payment methods, overdue bills and payment requests.
+- To pay, call make_payment with the bill ID and the last four digits of the card the customer chose. Never choose a card yourself.
+- If a payment request is open, offer to resume it by calling make_payment for its bill.
+- Say a bill is Paid only when make_payment reports it is Paid.
 - If the payment service is unavailable, say the request is saved and offer to retry later.
 - If a payment is declined, say so and ask the customer whether to try again.
 """
@@ -34,30 +37,33 @@ def overdue_bills(db: Database, store: PaymentStore, customer_id: str) -> list[B
     return [b for b in DataLayer.get_customer_bills(db, customer_id, OVERDUE).bills if b.bill_id not in paid]
 
 
-def build_tools(db: Database, store: PaymentStore, gateway: SimulatedGateway) -> list[BaseTool]:
+def build_tools(db: Database, store: PaymentStore, script: list[GatewayOutcome]) -> list[BaseTool]:
     @tool
-    def get_overdue_bills(customer_id: str) -> str:
-        """List a customer's overdue bills with amounts and due dates. Bills already paid are left out."""
-        bills: list[Bill] = overdue_bills(db, store, customer_id)
-        return Database(plans=[], devices=[], lines=[], customers=[], bills=bills).model_dump_json()
+    def get_customer_payment_details(customer_id: str) -> str:
+        """Get a customer's usable payment methods, overdue bills and payment requests."""
+        usable: Database = DataLayer.get_usable_payment_methods(db, customer_id, REFERENCE_DATE)
+        details: dict[str, Any] = {
+            "customers": [c.model_dump() for c in usable.customers],
+            "overdue_bills": [b.model_dump() for b in overdue_bills(db, store, customer_id)],
+            "payment_requests": [r.model_dump() for r in store.list_requests(customer_id)],
+        }
+        return json.dumps(details, default=str)
 
     @tool
-    def check_payment_requests(customer_id: str) -> str:
-        """List a customer's payment requests with their IDs and status. Use this to find unfinished requests."""
-        return json.dumps([r.model_dump() for r in store.list_requests(customer_id)])
-
-    @tool
-    def pay_bill(customer_id: str, bill_id: str) -> str:
-        """Pay an overdue bill. Resumes the bill's open request if there is one, otherwise creates a request, then charges it."""
+    def make_payment(customer_id: str, bill_id: str, card_last_4: str) -> str:
+        """Pay an overdue bill with a usable card, given by its last four digits. Resumes the bill's open request if there is one, otherwise creates one, then charges it."""
         bill: Bill | None = next((b for b in overdue_bills(db, store, customer_id) if b.bill_id == bill_id), None)
         if bill is None:
             return f"Bill {bill_id} is not an overdue bill for this customer."
+        usable: Database = DataLayer.get_usable_payment_methods(db, customer_id, REFERENCE_DATE)
+        if card_last_4 not in [m.account_number_last_4 for m in usable.customers[0].payment_methods]:
+            return f"Card ending {card_last_4} is not a usable payment method for this customer."
         request: PaymentRequest | None = next(
             (r for r in store.list_requests(customer_id) if r.bill_id == bill_id and r.status == OPEN), None
         )
         if request is None:
             request = store.create_request(customer_id, bill_id, bill.total_due)
-        outcome: GatewayOutcome = gateway.charge()
+        outcome: GatewayOutcome = simulated_charge(script)
         if outcome == "unavailable":
             return f"The payment service is unavailable. Request {request.request_id} is saved as open."
         if outcome == "declined":
@@ -66,25 +72,25 @@ def build_tools(db: Database, store: PaymentStore, gateway: SimulatedGateway) ->
         store.save(request)
         return f"Bill {bill_id} is now Paid. Payment request {request.request_id}."
 
-    return [get_overdue_bills, check_payment_requests, pay_bill]
+    return [get_customer_payment_details, make_payment]
 
 
 class Agent:
-    """Helps a customer pay an overdue bill. Each pay_bill call waits for an approval decision. Conversation state is in the checkpointer; payment requests are in the store."""
+    """Helps a customer pay an overdue bill. Each make_payment call waits for an approval decision. Conversation state is in the checkpointer; payment requests are in the store."""
 
     def __init__(
         self,
         db: Database,
         llm: BaseChatModel,
         store: PaymentStore,
-        gateway: SimulatedGateway,
+        script: list[GatewayOutcome],
         checkpointer: BaseCheckpointSaver,
     ) -> None:
         self._agent = create_agent(
             model=llm,
-            tools=build_tools(db, store, gateway),
+            tools=build_tools(db, store, script),
             system_prompt=SYSTEM_PROMPT,
-            middleware=[HumanInTheLoopMiddleware(interrupt_on={"pay_bill": True})],
+            middleware=[HumanInTheLoopMiddleware(interrupt_on={"make_payment": True})],
             checkpointer=checkpointer,
         )
 

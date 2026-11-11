@@ -12,7 +12,7 @@ import journey_1_agent
 from journey_3_agent import Agent
 from file_loader import load_database
 from models import Database
-from payments import PaymentStore, SimulatedGateway
+from payments import GatewayOutcome, PaymentStore
 
 DB_PATH: Path = Path(__file__).parents[1] / "datasource" / "db.toml"
 
@@ -42,17 +42,18 @@ def make_llm() -> ChatOpenAI:
     )
 
 
-def run_turn(agent: Agent, thread_id: str, question: str, approve: bool = True) -> None:
+def run_turn(agent: Agent, thread_id: str, question: str, approve: bool = True) -> dict[str, Any]:
     """Send one message. If the agent asks to pay, answer the approval request with the given decision."""
     result: dict[str, Any] = agent.send(thread_id, f"Customer ID: C1002\n\n{question}")
     if "__interrupt__" in result:
         result = agent.decide(thread_id, approve)
     print(result["messages"][-1].content)
+    return result
 
 
 def test_pay_overdue_bill_end_to_end(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
-    agent = Agent(db, make_llm(), store, SimulatedGateway([]), checkpointer)
-    run_turn(agent, "t1", "Pay overdue bill B1005.")
+    script: list[GatewayOutcome] = []
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t1", "Pay overdue bill B1005 with the debit card ending 1234.")
     requests = store.list_requests("C1002")
     assert len(requests) == 1
     assert requests[0].bill_id == "B1005"
@@ -60,32 +61,49 @@ def test_pay_overdue_bill_end_to_end(db: Database, store: PaymentStore, checkpoi
 
 
 def test_rejected_approval_does_not_charge(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
-    agent = Agent(db, make_llm(), store, SimulatedGateway([]), checkpointer)
-    run_turn(agent, "t1", "Pay overdue bill B1005.", approve=False)
+    script: list[GatewayOutcome] = []
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t1", "Pay overdue bill B1005 with the debit card ending 1234.", approve=False)
     assert all(r.status != "Paid" for r in store.list_requests("C1002"))
 
 
 def test_outage_keeps_request_and_resumes_in_new_conversation(
     db: Database, store: PaymentStore, checkpointer: SqliteSaver
 ) -> None:
-    gateway = SimulatedGateway(["unavailable"])
-    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t1", "Pay overdue bill B1005.")
+    script: list[GatewayOutcome] = ["unavailable"]
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t1", "Pay overdue bill B1005 with the debit card ending 1234.")
     requests = store.list_requests("C1002")
     assert len(requests) == 1
     assert requests[0].status == "Open"
 
-    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t2", "I am back. Resume the unfinished payment for bill B1005.")
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t2", "I am back. Resume the unfinished payment for bill B1005 with the debit card ending 1234.")
     requests = store.list_requests("C1002")
     assert len(requests) == 1
     assert requests[0].status == "Paid"
 
 
 def test_declined_payment_can_be_retried(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
-    gateway = SimulatedGateway(["declined"])
-    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t1", "Pay overdue bill B1005.")
+    script: list[GatewayOutcome] = ["declined"]
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t1", "Pay overdue bill B1005 with the debit card ending 1234.")
     assert store.list_requests("C1002")[0].status == "Open"
 
-    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t2", "Try the payment for bill B1005 again.")
+    run_turn(Agent(db, make_llm(), store, script, checkpointer), "t2", "Try the payment for bill B1005 again with the debit card ending 1234.")
     requests = store.list_requests("C1002")
     assert len(requests) == 1
     assert requests[0].status == "Paid"
+
+
+def test_customer_says_no_then_yes_in_same_conversation(
+    db: Database, store: PaymentStore, checkpointer: SqliteSaver
+) -> None:
+    script: list[GatewayOutcome] = []
+    agent = Agent(db, make_llm(), store, script, checkpointer)
+
+    run_turn(agent, "t1", "Pay overdue bill B1005 with the debit card ending 1234.", approve=False)
+    assert store.list_requests("C1002") == []
+
+    result: dict[str, Any] = run_turn(
+        agent, "t1", "Yes, I changed my mind. Go ahead and pay bill B1005 with the debit card ending 1234."
+    )
+    for message in result["messages"]:
+        print(f"{message.type}: {message.content}")
+    assert [(r.bill_id, r.status) for r in store.list_requests("C1002")] == [("B1005", "Paid")]

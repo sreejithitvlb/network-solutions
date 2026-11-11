@@ -62,11 +62,6 @@ class PaymentStore:
         self._conn.commit()
 
 
-class SimulatedGateway:
-    """Scripted payment gateway. Each charge takes the next scripted outcome. Once the script is used up, charges succeed."""
-
-    def __init__(self, script: list[GatewayOutcome]) -> None:
-        self._script: list[GatewayOutcome] = script
-
-    def charge(self) -> GatewayOutcome:
-        return self._script.pop(0) if self._script else "ok"
+def simulated_charge(script: list[GatewayOutcome]) -> GatewayOutcome:
+    """Simulated charge. Takes the next scripted outcome; once the script is used up, charges succeed."""
+    return script.pop(0) if script else "ok"
