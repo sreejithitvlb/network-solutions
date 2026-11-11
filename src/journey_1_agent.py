@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
@@ -10,7 +11,9 @@ from pydantic import BaseModel, Field
 from models import BillStatus, Database
 from search import DataLayer
 
-MODEL_BASE_URL: str = "http://100.66.165.94:8000/v1"
+MODEL_BASE_URL: str = os.environ["LLM_BASE_URL"]
+EMBED_BASE_URL: str = os.environ["EMBED_BASE_URL"]
+EMBED_MODEL: str = os.environ["EMBED_MODEL"]
 MODEL_NAME: str = "qwen2.5-7b"
 MAX_STEPS: int = 6
 
