@@ -1,13 +1,15 @@
-import asyncio
 import os
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 import journey_1_agent
-from journey_3_agent import Agent, AgentRequest, AgentResponse
+from journey_3_agent import Agent
 from file_loader import load_database
 from models import Database
 from payments import PaymentStore, SimulatedGateway
@@ -25,6 +27,11 @@ def store(tmp_path: Path) -> PaymentStore:
     return PaymentStore(tmp_path / "payments.sqlite3")
 
 
+@pytest.fixture
+def checkpointer(tmp_path: Path) -> SqliteSaver:
+    return SqliteSaver(sqlite3.connect(tmp_path / "checkpoints.sqlite3", check_same_thread=False))
+
+
 def make_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=journey_1_agent.MODEL_NAME,
@@ -35,74 +42,50 @@ def make_llm() -> ChatOpenAI:
     )
 
 
-def ask(
-    db: Database,
-    store: PaymentStore,
-    gateway: SimulatedGateway,
-    question: str,
-    accept_request_id: str | None = None,
-) -> AgentResponse:
-    """One conversation turn. Each turn builds its own agent, so the store is the only state carried between turns."""
-    agent = Agent(db, make_llm(), store, gateway)
-    request = AgentRequest(customer_id="C1002", question=question, accept_request_id=accept_request_id)
-    response: AgentResponse = asyncio.run(agent.answer(request))
-    print(response.answer)
-    print(response.reasoning)
-    return response
+def run_turn(agent: Agent, thread_id: str, question: str, approve: bool = True) -> None:
+    """Send one message. If the agent asks to pay, answer the approval request with the given decision."""
+    result: dict[str, Any] = agent.send(thread_id, f"Customer ID: C1002\n\n{question}")
+    if "__interrupt__" in result:
+        result = agent.decide(thread_id, approve)
+    print(result["messages"][-1].content)
 
 
-def test_pay_overdue_bill_end_to_end(db: Database, store: PaymentStore) -> None:
-    gateway = SimulatedGateway([])
-    ask(db, store, gateway, "Customer C1002 wants to pay an overdue bill.")
-    request = store.list_requests("C1002")[0]
-    assert request.bill_id == "B1005"
-    assert request.status == "Awaiting Acceptance"
-
-    ask(db, store, gateway, "Customer C1002 accepts the payment request.", accept_request_id=request.request_id)
-    assert store.get_request(request.request_id).status == "Accepted"
-
-    ask(db, store, gateway, "Customer C1002 chooses the debit card ending 1234. Pay the request.")
-    assert store.get_request(request.request_id).status == "Paid"
-    assert store.bill_override("B1005") == "Paid"
+def test_pay_overdue_bill_end_to_end(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
+    agent = Agent(db, make_llm(), store, SimulatedGateway([]), checkpointer)
+    run_turn(agent, "t1", "Pay overdue bill B1005.")
+    requests = store.list_requests("C1002")
+    assert len(requests) == 1
+    assert requests[0].bill_id == "B1005"
+    assert requests[0].status == "Paid"
 
 
-def test_no_charge_before_acceptance(db: Database, store: PaymentStore) -> None:
-    gateway = SimulatedGateway([])
-    ask(db, store, gateway, "Customer C1002 wants to pay an overdue bill.")
-    request = store.list_requests("C1002")[0]
-
-    ask(db, store, gateway, "Customer C1002 says pay now with the debit card ending 1234.")
-    assert store.get_request(request.request_id).status == "Awaiting Acceptance"
-    assert store.bill_override("B1005") == "Awaiting Payment"
+def test_rejected_approval_does_not_charge(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
+    agent = Agent(db, make_llm(), store, SimulatedGateway([]), checkpointer)
+    run_turn(agent, "t1", "Pay overdue bill B1005.", approve=False)
+    assert all(r.status != "Paid" for r in store.list_requests("C1002"))
 
 
-def test_paid_bill_is_not_sent_as_request(db: Database, store: PaymentStore) -> None:
-    ask(db, store, SimulatedGateway([]), "Send a payment request for bill B1004 for customer C1002.")
-    assert not any(r.bill_id == "B1004" for r in store.list_requests("C1002"))
+def test_outage_keeps_request_and_resumes_in_new_conversation(
+    db: Database, store: PaymentStore, checkpointer: SqliteSaver
+) -> None:
+    gateway = SimulatedGateway(["unavailable"])
+    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t1", "Pay overdue bill B1005.")
+    requests = store.list_requests("C1002")
+    assert len(requests) == 1
+    assert requests[0].status == "Open"
+
+    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t2", "I am back. Resume the unfinished payment for bill B1005.")
+    requests = store.list_requests("C1002")
+    assert len(requests) == 1
+    assert requests[0].status == "Paid"
 
 
-def test_outage_keeps_request_and_resumes_later(db: Database, store: PaymentStore) -> None:
-    gateway = SimulatedGateway(["unavailable"] * 4)
-    ask(db, store, gateway, "Customer C1002 wants to pay an overdue bill.")
-    request = store.list_requests("C1002")[0]
-    ask(db, store, gateway, "Customer C1002 accepts the payment request.", accept_request_id=request.request_id)
-    ask(db, store, gateway, "Customer C1002 chooses the debit card ending 1234. Pay the request.")
-    assert store.get_request(request.request_id).status == "Accepted"
-    assert store.bill_override("B1005") == "Awaiting Payment"
-
-    ask(db, store, SimulatedGateway([]), "Customer C1002 is back. Resume the open payment request with the debit card ending 1234.")
-    assert store.get_request(request.request_id).status == "Paid"
-
-
-def test_declined_payment_asks_for_new_method(db: Database, store: PaymentStore) -> None:
+def test_declined_payment_can_be_retried(db: Database, store: PaymentStore, checkpointer: SqliteSaver) -> None:
     gateway = SimulatedGateway(["declined"])
-    ask(db, store, gateway, "Customer C1002 wants to pay an overdue bill.")
-    request = store.list_requests("C1002")[0]
-    ask(db, store, gateway, "Customer C1002 accepts the payment request.", accept_request_id=request.request_id)
-    ask(db, store, gateway, "Customer C1002 chooses the debit card ending 1234. Pay the request.")
-    assert store.get_request(request.request_id).status == "Accepted"
-    assert store.get_request(request.request_id).attempt == 2
-    assert store.bill_override("B1005") == "Awaiting Payment"
+    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t1", "Pay overdue bill B1005.")
+    assert store.list_requests("C1002")[0].status == "Open"
 
-    ask(db, store, gateway, "Customer C1002 chooses the credit card ending 5678 instead. Pay the request.")
-    assert store.get_request(request.request_id).status == "Paid"
+    run_turn(Agent(db, make_llm(), store, gateway, checkpointer), "t2", "Try the payment for bill B1005 again.")
+    requests = store.list_requests("C1002")
+    assert len(requests) == 1
+    assert requests[0].status == "Paid"

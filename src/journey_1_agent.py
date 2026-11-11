@@ -1,6 +1,7 @@
 import os
 from typing import Literal
 
+from icecream import ic
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
@@ -121,12 +122,14 @@ class Agent:
     """Answers customer questions. The database, tools and bound model are set up once, at construction."""
 
     def __init__(self, db: Database, llm: BaseChatModel) -> None:
-        self._tools_by_name: dict[str, BaseTool] = {t.name: t for t in build_tools(db)}
+        tools: list[BaseTool] = build_tools(db)
+        self._tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
         self._model: Runnable[LanguageModelInput, AIMessage] = llm.bind_tools(
-            [FinalAnswer, *self._tools_by_name.values()], tool_choice="required"
+            [FinalAnswer, *tools], tool_choice="required"
         )
 
     async def answer(self, request: AgentRequest) -> AgentResponse:
+        ic(self._model)
         messages: list[BaseMessage] = [SystemMessage(SYSTEM_PROMPT), HumanMessage(request.question)]
         customer_found: bool = False
         try:
@@ -139,7 +142,7 @@ class Agent:
                         if customer_found and final.outcome != "needs_customer":
                             final.outcome = "answered"
                         return AgentResponse(**final.model_dump())
-                    result: ToolMessage = self._tools_by_name[call["name"]].invoke(call)
+                    result: ToolMessage = await self._tools_by_name[call["name"]].ainvoke(call)
                     if result.status == "success" and Database.model_validate_json(result.content).customers:
                         customer_found = True
                     messages.append(result)
